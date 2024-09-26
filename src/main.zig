@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const PERF = std.os.linux.PERF;
 const fd_t = std.posix.fd_t;
@@ -5,6 +6,12 @@ const pid_t = std.os.pid_t;
 const assert = std.debug.assert;
 const progress = @import("./progress.zig");
 const MAX_SAMPLES = 10000;
+
+const Events = switch (builtin.os.tag) {
+    .linux => @import("os/linux.zig").Events,
+    .macos => @import("os/macos.zig").Events,
+    else => @compileError("unsupported OS"),
+};
 
 const usage_text =
     \\Usage: poop [options] <command1> ... <commandN>
@@ -17,19 +24,6 @@ const usage_text =
     \\                            available options: 'auto', 'never', 'ansi'
     \\
 ;
-
-const PerfMeasurement = struct {
-    name: []const u8,
-    config: PERF.COUNT.HW,
-};
-
-const perf_measurements = [_]PerfMeasurement{
-    .{ .name = "cpu_cycles", .config = PERF.COUNT.HW.CPU_CYCLES },
-    .{ .name = "instructions", .config = PERF.COUNT.HW.INSTRUCTIONS },
-    .{ .name = "cache_references", .config = PERF.COUNT.HW.CACHE_REFERENCES },
-    .{ .name = "cache_misses", .config = PERF.COUNT.HW.CACHE_MISSES },
-    .{ .name = "branch_misses", .config = PERF.COUNT.HW.BRANCH_MISSES },
-};
 
 const Command = struct {
     raw_cmd: []const u8,
@@ -48,7 +42,7 @@ const Command = struct {
     };
 };
 
-const Sample = struct {
+pub const Sample = struct {
     wall_time: u64,
     cpu_cycles: u64,
     instructions: u64,
@@ -157,7 +151,7 @@ pub fn main() !void {
         .ansi => .escape_codes,
     };
 
-    var perf_fds = [1]fd_t{-1} ** perf_measurements.len;
+    var events: Events = undefined;
     var samples_buf: [MAX_SAMPLES]Sample = undefined;
 
     var stderr_buffer: [4096]u8 = undefined;
@@ -186,25 +180,7 @@ pub fn main() !void {
             sample_index < samples_buf.len) : (sample_index += 1)
         {
             if (tty_conf != .no_color) try bar.render();
-            for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
-                var attr: std.os.linux.perf_event_attr = .{
-                    .type = PERF.TYPE.HARDWARE,
-                    .config = @intFromEnum(measurement.config),
-                    .flags = .{
-                        .disabled = true,
-                        .exclude_kernel = true,
-                        .exclude_hv = true,
-                        .inherit = true,
-                        .enable_on_exec = true,
-                    },
-                };
-                perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, perf_fds[0], PERF.FLAG.FD_CLOEXEC) catch |err| {
-                    std.debug.panic("unable to open perf event: {s}\n", .{@errorName(err)});
-                };
-            }
-
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
+            events = Events.init();
 
             var child = std.process.Child.init(command.argv, arena);
 
@@ -242,7 +218,10 @@ pub fn main() !void {
 
             const term = try child.wait();
             const end = timer.read();
-            _ = std.os.linux.ioctl(perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
+            _ = switch (builtin.os.tag) {
+                .linux => std.os.linux.ioctl(events.perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP),
+                else => {},
+            };
             const peak_rss = child.resource_usage_statistics.getMaxRss() orelse 0;
 
             switch (term) {
@@ -283,19 +262,8 @@ pub fn main() !void {
                 },
             }
 
-            samples_buf[sample_index] = .{
-                .wall_time = end - start,
-                .peak_rss = peak_rss,
-                .cpu_cycles = readPerfFd(perf_fds[0]),
-                .instructions = readPerfFd(perf_fds[1]),
-                .cache_references = readPerfFd(perf_fds[2]),
-                .cache_misses = readPerfFd(perf_fds[3]),
-                .branch_misses = readPerfFd(perf_fds[4]),
-            };
-            for (&perf_fds) |*perf_fd| {
-                std.posix.close(perf_fd.*);
-                perf_fd.* = -1;
-            }
+            samples_buf[sample_index] = events.sample(end - start, peak_rss);
+            events.reset();
 
             if (tty_conf != .no_color) {
                 bar.estimate = est_total: {
@@ -395,15 +363,6 @@ pub fn main() !void {
 fn parseCmd(list: *std.ArrayList([]const u8), cmd: []const u8) !void {
     var it = std.mem.tokenizeScalar(u8, cmd, ' ');
     while (it.next()) |s| try list.append(s);
-}
-
-fn readPerfFd(fd: fd_t) usize {
-    var result: usize = 0;
-    const n = std.posix.read(fd, std.mem.asBytes(&result)) catch |err| {
-        std.debug.panic("unable to read perf fd: {s}\n", .{@errorName(err)});
-    };
-    assert(n == @sizeOf(usize));
-    return result;
 }
 
 const Measurement = struct {

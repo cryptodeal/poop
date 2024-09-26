@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 const Spinner = struct {
@@ -36,7 +37,10 @@ const Winsize = extern struct {
 
 pub fn getScreenWidth(stdout: std.posix.fd_t) usize {
     var winsize: Winsize = undefined;
-    _ = std.os.linux.ioctl(stdout, TIOCGWINSZ, @intFromPtr(&winsize));
+    _ = switch (builtin.os.tag) {
+        .linux, .macos => std.c.ioctl(stdout, TIOCGWINSZ, @intFromPtr(&winsize)),
+        else => @compileError("unsupported OS"),
+    };
     return @intCast(winsize.ws_col);
 }
 
